@@ -8,12 +8,27 @@ import numpy as np
 import re
 from urllib.parse import urljoin
 
-# Mistral 0.4.2 (legacy client) 
+# Mistral 0.4.2 (legacy client)
 from mistralai.client import MistralClient
 
 import google.generativeai as genai
 from PIL import Image
 from PyPDF2 import PdfReader
+
+# --- Tambahan import untuk dashboard ---
+import plotly.express as px
+import plotly.graph_objects as go
+from collections import Counter
+import json
+import string
+
+# WordCloud opsional (fallback otomatis kalau belum terpasang)
+try:
+    from wordcloud import WordCloud
+    HAS_WORDCLOUD = True
+except Exception:
+    HAS_WORDCLOUD = False
+
 
 # --------------------- Page config ---------------------
 st.set_page_config(page_title="Document Intelligence Agent", layout="wide")
@@ -97,11 +112,9 @@ def _generate_with_fallback(parts_or_prompt):
         except Exception as e:
             last_error = e
             if _is_quota_error(e):
-                # coba model berikutnya segera
                 continue
             else:
                 return f"Error generating response: {e}"
-    # Semua kandidat gagal; jika karena kuota, tunggu sebentar lalu coba terakhir
     if last_error and _is_quota_error(last_error):
         time.sleep(30)
         try:
@@ -123,10 +136,6 @@ def _truncate_context(text: str, max_chars: int = 20000) -> str:
 EMBEDDING_MODEL = "models/text-embedding-004"
 
 def _chunk_text(text: str, chunk_size: int = 1800, overlap: int = 200) -> list:
-    """
-    Split long text into overlapping chunks for retrieval.
-    chunk_size and overlap are character-based for simplicity and speed.
-    """
     if not text:
         return []
     chunks = []
@@ -143,8 +152,6 @@ def _chunk_text(text: str, chunk_size: int = 1800, overlap: int = 200) -> list:
     return chunks
 
 def _extract_embedding_values(resp) -> list:
-    """Make embedding response robust across SDK variations."""
-    # Try attribute access first
     emb = getattr(resp, "embedding", None)
     if emb is not None:
         values = getattr(emb, "values", emb)
@@ -152,7 +159,6 @@ def _extract_embedding_values(resp) -> list:
             return list(values)
         if isinstance(values, dict) and "values" in values:
             return list(values["values"])
-    # Fallback to dict-like
     if isinstance(resp, dict):
         emb = resp.get("embedding")
         if isinstance(emb, dict) and "values" in emb:
@@ -172,28 +178,21 @@ def _embed_text(text: str) -> np.ndarray:
         return np.array([])
 
 def _build_retrieval_index(full_text: str):
-    """
-    Build an in-memory retrieval index (chunks + embeddings) and store in session.
-    If embedding generation fails, the app will fall back to full-context QA.
-    """
-    # Check if we already have embeddings for this exact text (caching)
     text_hash = str(hash(full_text))
     if (st.session_state.get("cached_text_hash") == text_hash and 
         st.session_state.get("retrieval_embeddings") is not None):
-        return  # Use cached embeddings
-    
+        return
     chunks = _chunk_text(full_text)
     embeddings = []
-    
-    # Limit chunks to reduce API calls (max 10 chunks)
+
     max_chunks = min(len(chunks), 10)
     chunks = chunks[:max_chunks]
     
-    for i, ch in enumerate(chunks):
+    for ch in chunks:
         try:
             vec = _embed_text(ch)
             if vec.size == 0:
-                embeddings = []  # invalidate index
+                embeddings = []
                 break
             embeddings.append(vec)
         except Exception as e:
@@ -210,7 +209,7 @@ def _build_retrieval_index(full_text: str):
         st.session_state.retrieval_chunks = chunks
         st.session_state.retrieval_embeddings = matrix
         st.session_state.retrieval_norms = np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-10
-        st.session_state.cached_text_hash = text_hash  # Cache the hash
+        st.session_state.cached_text_hash = text_hash
     else:
         st.session_state.retrieval_chunks = None
         st.session_state.retrieval_embeddings = None
@@ -218,7 +217,6 @@ def _build_retrieval_index(full_text: str):
         st.session_state.cached_text_hash = None
 
 def _retrieve_top_k(query: str, k: int = 5) -> list:
-    """Return top-k most similar chunks to the query using cosine similarity."""
     if not query:
         return []
     chunks = st.session_state.get("retrieval_chunks")
@@ -235,11 +233,8 @@ def _retrieve_top_k(query: str, k: int = 5) -> list:
     sims = sims.ravel()
     top_idx = np.argsort(-sims)[: max(1, k)]
     return [chunks[i] for i in top_idx]
+
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """
-    Ekstrak teks dari PDF non-scan via PyPDF2 (cepat & lokal).
-    Jika kosong (kemungkinan scan), nanti fallback ke Gemini OCR.
-    """
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         parts = []
@@ -251,9 +246,7 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
         return ""
 
 def gemini_ocr_image(image_bytes: bytes) -> str:
-    """OCR gambar (PNG/JPG) ke Markdown via Gemini."""
     img = Image.open(io.BytesIO(image_bytes))
-    # 1) Coba sebagai dokumen terlebih dahulu
     prompt_doc = (
         "Convert this document image into clean Markdown. "
         "Preserve headings, lists, and tables (use Markdown tables). "
@@ -261,7 +254,6 @@ def gemini_ocr_image(image_bytes: bytes) -> str:
     )
     text = _generate_with_fallback([prompt_doc, img])
     if not text or len(text.strip()) < 30:
-        # 2) Jika bukan dokumen, fallback: deskripsi/caption gambar
         prompt_cap_id = (
             "Jelaskan gambar ini secara ringkas, jelas, dan akurat. "
             "Sebutkan objek utama, konteks, warna, teks (jika ada), dan hal penting lainnya."
@@ -275,8 +267,6 @@ def gemini_ocr_image(image_bytes: bytes) -> str:
     return text
 
 def gemini_ocr_pdf(pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
-    """OCR + ekstraksi PDF (termasuk scan) ke Markdown via Gemini."""
-    # Simpan sementara agar bisa di-upload ke Gemini
     suffix = os.path.splitext(filename)[1] or ".pdf"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(pdf_bytes)
@@ -287,9 +277,8 @@ def gemini_ocr_pdf(pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
             mime_type="application/pdf",
             display_name=filename
         )
-        # Pastikan file sudah siap diproses sebelum dipakai di generate_content
         try:
-            for _ in range(30):  # tunggu hingga ~30 detik maksimal
+            for _ in range(30):
                 f = genai.get_file(file_obj.name)
                 state = getattr(getattr(f, "state", None), "name", getattr(f, "state", ""))
                 if str(state).upper() == "ACTIVE":
@@ -298,7 +287,6 @@ def gemini_ocr_pdf(pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
             else:
                 return "Error: File processing timed out. Please try again."
         except Exception:
-            # Jika pengecekan status gagal, beri sedikit jeda lalu lanjut mencoba
             time.sleep(2)
         prompt = (
             "Extract the full content of this PDF as clean Markdown. "
@@ -312,14 +300,8 @@ def gemini_ocr_pdf(pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
             pass
 
 def process_document_with_gemini(kind: str, name: str, data: bytes) -> str:
-    """
-    Router sederhana:
-    - PDF: coba PyPDF2 dulu (cepat). Jika terlalu pendek/kosong → fallback Gemini OCR.
-    - Image: langsung pakai Gemini OCR.
-    """
     if kind == "pdf":
         text = extract_text_from_pdf_bytes(data)
-        # Jika hasil terlalu pendek (kemungkinan scan), fallback OCR via Gemini
         if len(text) >= 200:
             return text
         return gemini_ocr_pdf(data, filename=name)
@@ -327,7 +309,6 @@ def process_document_with_gemini(kind: str, name: str, data: bytes) -> str:
         return gemini_ocr_image(data)
 
 def answer_from_image(image_bytes: bytes, question: str) -> str:
-    """Jawab pertanyaan langsung dari gambar (visual Q&A) dengan Gemini."""
     try:
         img = Image.open(io.BytesIO(image_bytes))
         if ANSWER_LANGUAGE == "Bahasa Indonesia":
@@ -347,19 +328,14 @@ def answer_from_image(image_bytes: bytes, question: str) -> str:
         return f"Error generating visual answer: {e}"
 
 def generate_response(context: str, query: str) -> str:
-    """Jawab pertanyaan berdasarkan dokumen menggunakan RAG bila tersedia, tanpa truncation artifisial."""
     if not context or len(context) < 10:
-        # Coba jawab langsung dari gambar jika tersedia
         if "image_bytes" in st.session_state and isinstance(st.session_state.image_bytes, dict):
-            # Multiple images - try to find relevant one based on query
             for img_name, img_bytes in st.session_state.image_bytes.items():
                 if any(word.lower() in img_name.lower() for word in query.lower().split()):
                     return answer_from_image(img_bytes, query)
-            # If no specific match, use first image
             first_img = next(iter(st.session_state.image_bytes.values()))
             return answer_from_image(first_img, query)
         elif "image_bytes" in st.session_state:
-            # Single image (backward compatibility)
             return answer_from_image(st.session_state.image_bytes, query)
         return "Error: Document context is empty or too short."
     
@@ -368,10 +344,8 @@ def generate_response(context: str, query: str) -> str:
         if retrieved_chunks:
             context_block = "\n\n---\n\n".join(retrieved_chunks)
         else:
-            # Fallback: gunakan seluruh konteks tanpa pemotongan manual
             context_block = context
         
-        # Add document context if multiple documents
         doc_context = ""
         if st.session_state.get("documents") and len(st.session_state.documents) > 1:
             doc_names = [doc['name'] for doc in st.session_state.documents]
@@ -405,12 +379,10 @@ Respond in English concisely. If the answer is not in the context, say so. If th
 
 # --------------------- API Fallback & Caching ---------------------
 def generate_with_mistral_fallback(prompt: str) -> str:
-    """Fallback to Mistral API when Gemini hits quota limits."""
     if not mistral_client:
         return "Error: No Mistral API key configured for fallback."
     
     try:
-        # Use Mistral's chat completion
         response = mistral_client.chat(
             model="mistral-large-latest",
             messages=[{"role": "user", "content": prompt}]
@@ -420,14 +392,11 @@ def generate_with_mistral_fallback(prompt: str) -> str:
         return f"Error with Mistral fallback: {e}"
 
 def generate_response_with_fallback(context: str, query: str) -> str:
-    """Generate response with Gemini fallback to Mistral if quota exceeded."""
     try:
-        # Try Gemini first
         return generate_response(context, query)
     except Exception as e:
         if "429" in str(e) or "quota" in str(e).lower():
             st.warning("⚠️ Gemini API quota exceeded. Falling back to Mistral API...")
-            # Fallback to Mistral
             if ANSWER_LANGUAGE == "Bahasa Indonesia":
                 mistral_prompt = f"""
 Anda adalah asisten analisis dokumen. Gunakan konteks berikut untuk menjawab:
@@ -456,7 +425,6 @@ Respond in English concisely. If the answer is not in the context, say so.
 
 # --------------------- Document Management Helpers ---------------------
 def clear_all_document_state():
-    """Clear all document-related session state variables."""
     st.session_state.documents = []
     st.session_state.ocr_content = None
     st.session_state.retrieval_chunks = None
@@ -466,7 +434,6 @@ def clear_all_document_state():
     st.session_state.chat_history = []
 
 def rebuild_document_content():
-    """Rebuild combined content and RAG index from remaining documents."""
     if st.session_state.documents:
         all_content = [f"--- DOCUMENT: {d['name']} ---\n{d['content']}" for d in st.session_state.documents]
         st.session_state.ocr_content = "\n\n".join(all_content)
@@ -477,18 +444,229 @@ def rebuild_document_content():
         st.session_state.retrieval_embeddings = None
         st.session_state.retrieval_norms = None
 
+
+# ======================= DASHBOARD HELPERS =======================
+_ID_STOPWORDS = {
+    "yang","dan","di","ke","dari","untuk","pada","dengan","ini","itu","ada","tidak","atau","karena","sebagai",
+    "dalam","atas","oleh","sebuah","para","akan","juga","sudah","belum","saat","kami","kita","mereka","anda",
+    "ia","dia","tersebut","rp","usd","pt","tbk","persero","co","ltd","inc"
+}
+_EN_STOPWORDS = {
+    "the","and","of","to","in","for","on","at","by","with","from","as","is","are","was","were","be","been","a","an",
+    "this","that","these","those","it","its","we","you","they","he","she","them","our","your","their",
+    "or","not","but","if","then","so","than","such","per","vs"
+}
+STOPWORDS = _ID_STOPWORDS | _EN_STOPWORDS
+
+def _tokenize(text: str) -> list:
+    text = text.lower()
+    text = text.translate(str.maketrans({c: " " for c in string.punctuation}))
+    toks = [t for t in text.split() if t and t not in STOPWORDS and not t.isdigit() and len(t) > 2]
+    return toks
+
+def _compute_ocr_quality(text: str) -> float:
+    if not text: return 0.0
+    n = len(text)
+    good = sum(ch.isalnum() or ch.isspace() or ch in ".,:;-%()[]|/+\n" for ch in text)
+    bad = text.count("�")
+    short_lines = sum(1 for ln in text.splitlines() if 0 < len(ln.strip()) < 3)
+    score = (good / n) * 100.0
+    score -= min(25, bad * 0.5)
+    score -= min(15, short_lines * 0.2)
+    return max(0.0, min(100.0, score))
+
+def _structure_stats(md_text: str) -> dict:
+    if not md_text:
+        return {"text": 0, "tables": 0, "images": 0}
+    lines = md_text.splitlines()
+    table_lines = sum(1 for ln in lines if ln.strip().startswith("|") and ln.count("|") >= 2)
+    image_tags = md_text.count("![") + md_text.lower().count("<img")
+    text_chars = len(md_text)
+    return {"text": text_chars, "tables": table_lines, "images": image_tags}
+
+def _extract_sections(md_text: str):
+    sections = []
+    current_title = "Intro"
+    current_buf = []
+    for ln in md_text.splitlines():
+        if ln.startswith("--- DOCUMENT:"):
+            if current_buf:
+                sections.append((current_title, "\n".join(current_buf).strip()))
+                current_buf = []
+            current_title = ln.replace("--- DOCUMENT:", "").strip()
+        elif re.match(r"^\s{0,3}#{1,3}\s+\S", ln):
+            if current_buf:
+                sections.append((current_title, "\n".join(current_buf).strip()))
+                current_buf = []
+            current_title = re.sub(r"^\s{0,3}#{1,3}\s+", "", ln).strip()
+        else:
+            current_buf.append(ln)
+    if current_buf:
+        sections.append((current_title, "\n".join(current_buf).strip()))
+    return sections[:12] if sections else [("All", md_text)]
+
+def _missing_matrix(sections):
+    cats = ["N/A/NA", "Empty Lines", "Dashes(-/—)", "Question(?)"]
+    labels = [title[:40] + ("…" if len(title) > 40 else "") for title,_ in sections]
+    matrix = []
+    for _, txt in sections:
+        lines = txt.splitlines()
+        na = sum(bool(re.search(r"\b(n/?a|tidak tersedia|kosong)\b", ln, re.I)) for ln in lines)
+        empty = sum(1 for ln in lines if not ln.strip())
+        dashes = sum(ln.count("-") + ln.count("—") for ln in lines)
+        ques = txt.count("?")
+        matrix.append([na, empty, dashes, ques])
+    return labels, cats, np.array(matrix).T
+
+def _is_financial_report(text: str) -> bool:
+    keys = ["revenue","pendapatan","penjualan","income","profit","laba","rugi",
+            "neraca","balance sheet","arus kas","cash flow","laba kotor","gross","operating","net"]
+    t = text.lower()
+    return any(k in t for k in keys)
+
+_num_pat = re.compile(r"([\-]?\d{1,3}(?:[\.,]\d{3})*(?:[\.,]\d{1,2})?)")
+
+def _parse_number(s: str):
+    s = s.strip()
+    if not s: return None
+    if "." in s and "," in s:
+        if s.find(".") < s.find(","):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    else:
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        digits = re.sub(r"[^\d\-\.]", "", s)
+        try:
+            return float(digits)
+        except Exception:
+            return None
+
+def _extract_financials(text: str):
+    rev = {}
+    prof = {}
+    gross = {}
+    op = {}
+    net = {}
+    assets = equity = curr_assets = curr_liab = debt = None
+
+    lines = text.splitlines()
+    for ln in lines:
+        years = re.findall(r"\b(20\d{2}|19\d{2})\b", ln)
+        if not years:
+            continue
+        y = int(years[0])
+
+        if re.search(r"\b(revenue|pendapatan|penjualan)\b", ln, re.I):
+            m = _num_pat.search(ln)
+            if m:
+                val = _parse_number(m.group(1))
+                if val is not None:
+                    rev[y] = val
+        if re.search(r"\b(net income|laba bersih|laba/rugi bersih|profit|laba)\b", ln, re.I):
+            m = _num_pat.search(ln)
+            if m:
+                val = _parse_number(m.group(1))
+                if val is not None:
+                    prof[y] = val
+        if re.search(r"\b(gross profit|laba kotor)\b", ln, re.I):
+            m = _num_pat.search(ln)
+            if m:
+                val = _parse_number(m.group(1))
+                if val is not None:
+                    gross[y] = val
+        if re.search(r"\b(operating profit|laba usaha|laba operasi)\b", ln, re.I):
+            m = _num_pat.search(ln)
+            if m:
+                val = _parse_number(m.group(1))
+                if val is not None:
+                    op[y] = val
+        if re.search(r"\b(net profit|net income|laba bersih)\b", ln, re.I):
+            m = _num_pat.search(ln)
+            if m:
+                val = _parse_number(m.group(1))
+                if val is not None:
+                    net[y] = val
+
+        if assets is None and re.search(r"\b(total assets|jumlah aset)\b", ln, re.I):
+            m = _num_pat.search(ln); assets = _parse_number(m.group(1)) if m else None
+        if equity is None and re.search(r"\b(total equity|ekuitas)\b", ln, re.I):
+            m = _num_pat.search(ln); equity = _parse_number(m.group(1)) if m else None
+        if curr_assets is None and re.search(r"\b(current assets|aset lancar)\b", ln, re.I):
+            m = _num_pat.search(ln); curr_assets = _parse_number(m.group(1)) if m else None
+        if curr_liab is None and re.search(r"\b(current liab|liabilitas lancar|utang lancar)\b", ln, re.I):
+            m = _num_pat.search(ln); curr_liab = _parse_number(m.group(1)) if m else None
+        if debt is None and re.search(r"\b(total debt|utang|pinjaman)\b", ln, re.I):
+            m = _num_pat.search(ln); debt = _parse_number(m.group(1)) if m else None
+
+    return {
+        "revenue_by_year": dict(sorted(rev.items())),
+        "profit_by_year": dict(sorted(prof.items())),
+        "gross_by_year": dict(sorted(gross.items())),
+        "operating_by_year": dict(sorted(op.items())),
+        "net_by_year": dict(sorted(net.items())),
+        "assets": assets, "equity": equity,
+        "current_assets": curr_assets, "current_liabilities": curr_liab, "debt": debt
+    }
+
+def _yoy_growth(series: dict) -> dict:
+    ys = sorted(series.keys())
+    growth = {}
+    for i in range(1, len(ys)):
+        y0, y1 = ys[i-1], ys[i]
+        if series[y0] and series[y0] != 0:
+            growth[y1] = (series[y1] - series[y0]) / abs(series[y0]) * 100.0
+    return growth
+
+def _readability_from_avg_sentence_len(text: str):
+    if not text: return 0.0, 0.0
+    sents = re.split(r"[.!?\n]+", text)
+    sents = [s.strip() for s in sents if s.strip()]
+    if not sents: return 0.0, 0.0
+    words = sum(len(s.split()) for s in sents)
+    avg = words / len(sents)
+    score = 100.0 - ((avg - 8) / (40 - 8)) * 100.0
+    score = max(0.0, min(100.0, score))
+    return avg, score
+
+def _ner_counts_with_gemini(text: str):
+    if not google_api_key:
+        return None
+    try:
+        prompt = """
+Extract counts of named entities by coarse type from the text.
+Only return a compact JSON like {"ORG": 12, "PERSON": 5, "LOC": 7}. Types limited to ORG, PERSON, LOC.
+If none detected, use 0.
+Text:
+""" + _truncate_context(text, 20000)
+        raw = _generate_with_fallback(prompt)
+        data = json.loads(re.findall(r"\{.*\}", raw, re.S)[0])
+        return {"ORG": int(data.get("ORG", 0)), "PERSON": int(data.get("PERSON", 0)), "LOC": int(data.get("LOC", 0))}
+    except Exception:
+        return None
+
+def _ner_counts_naive(text: str):
+    ORG = len(re.findall(r"\b(PT|Tbk|Persero|Inc\.?|Ltd\.?|LLC|Corp\.?)\b", text))
+    PERSON = len(re.findall(r"\b[A-Z][a-z]+ [A-Z][a-z]+(?: [A-Z][a-z]+)?\b", text))
+    LOC = len(re.findall(r"\b(Jakarta|Bandung|Surabaya|Medan|Indonesia|Singapore|Malaysia|USA|Europe|Asia)\b", text))
+    return {"ORG": ORG, "PERSON": PERSON, "LOC": LOC}
+
+
 # --------------------- UI Layout -----------------------
 col1, col2 = st.columns([1, 1])
 
 with col1:
     st.header("Document Upload")
     uploaded_files = st.file_uploader(
-        "Upload multiple documents (PDF, PNG, JPG, JPEG)",
+        "Upload multiple documents (DOC, PDF, PNG, JPG, JPEG)",
         type=["pdf", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
     )
     url_input = st.text_input("Or enter a URL (web page or document):")
-    # Persist last URL for use from Q&A panel
     st.session_state["url_input"] = url_input
 
     process_button = st.button("Process Documents")
@@ -502,10 +680,6 @@ with col1:
 
     # --------------------- URL processing helper -----------------------
     def process_url_to_content(url: str) -> tuple:
-        """
-        Download a URL and convert it into document content in session_state.
-        Returns (success: bool, message: str)
-        """
         try:
             r = requests.get(
                 url,
@@ -520,7 +694,6 @@ with col1:
             clean_url = url.split("?")[0]
             ext = os.path.splitext(clean_url)[1].lower()
             data = r.content
-            # Signature sniffing
             is_pdf_sig = data[:4] == b"%PDF"
             is_png_sig = data[:8] == b"\x89PNG\r\n\x1a\n"
             is_jpg_sig = data[:3] == b"\xff\xd8\xff"
@@ -529,7 +702,6 @@ with col1:
                 chosen_kind = "pdf"
             elif is_png_sig or is_jpg_sig or any(img_ct in content_type for img_ct in ["image/png", "image/jpeg", "image/jpg"]) or ext in [".png", ".jpg", ".jpeg"]:
                 chosen_kind = "image"
-            # HTML page → try to find asset link
             if not chosen_kind and content_type.startswith("text/html"):
                 html_text = r.text
                 links = re.findall(r'href=[\"\']([^\"\']+\.(?:pdf|png|jpe?g))(?:[\#\?][^\"\']*)?[\"\']', html_text, flags=re.IGNORECASE)
@@ -554,9 +726,7 @@ with col1:
                         chosen_kind = "image"
                         data = tdata
                         clean_url = target_url.split("?")[0]
-                        # Simpan untuk visual Q&A jika dibutuhkan
                         st.session_state.image_bytes = data
-                # Still HTML → extract visible text
                 if not chosen_kind:
                     stripped = re.sub(r"<script[\s\S]*?</script>", " ", html_text, flags=re.IGNORECASE)
                     stripped = re.sub(r"<style[\s\S]*?</style>", " ", stripped, flags=re.IGNORECASE)
@@ -582,7 +752,6 @@ with col1:
             return False, f"Error processing document: {e}"
 
     if process_button:
-        # Karena OCR memakai Gemini, butuh Google API key
         if not google_api_key:
             st.error("Please provide a valid Google API Key for OCR/processing.")
         if uploaded_files:
@@ -593,7 +762,6 @@ with col1:
                         ext = os.path.splitext(uploaded_file.name)[1].lower()
                         kind = "pdf" if ext == ".pdf" else "image"
                         if kind == "image":
-                            # Simpan image bytes untuk visual Q&A fallback
                             if "image_bytes" not in st.session_state:
                                 st.session_state.image_bytes = {}
                             st.session_state.image_bytes[uploaded_file.name] = uploaded_file.getvalue()
@@ -603,7 +771,6 @@ with col1:
                         )
                         
                         if content:
-                            # Store individual document
                             doc_info = {
                                 "name": uploaded_file.name,
                                 "type": kind,
@@ -618,17 +785,14 @@ with col1:
                     except Exception as e:
                         st.error(f"Error processing {uploaded_file.name}: {e}")
                 
-                # Combine all content for unified processing
                 if all_content:
                     st.session_state.ocr_content = "\n\n".join(all_content)
-                    # Build retrieval index for all documents combined
                     _build_retrieval_index(st.session_state.ocr_content)
                     st.success(f"All {len(uploaded_files)} documents processed and combined!")
         if url_input:
             with st.spinner("Downloading & processing from URL..."):
                 success, msg = process_url_to_content(url_input)
                 if success:
-                    # Add URL content to documents list if it was processed
                     if st.session_state.get("ocr_content"):
                         url_doc_info = {
                             "name": f"URL: {url_input[:50]}...",
@@ -649,119 +813,138 @@ with col2:
     if st.session_state.documents:
         st.markdown(f"**{len(st.session_state.documents)} document(s) loaded.**")
         
-        # Show memory usage and limits
         total_chars = sum(doc['size'] for doc in st.session_state.documents)
-        total_mb = total_chars / (1024 * 1024)  # Rough estimate: 1 char ≈ 1 byte
+        total_mb = total_chars / (1024 * 1024)
         
-        col1, col2, col3 = st.columns([2, 2, 1])
-        with col1:
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
             st.metric("Total Documents", len(st.session_state.documents))
-        with col2:
+        with c2:
             st.metric("Total Content", f"{total_chars:,} chars")
-        with col3:
+        with c3:
             st.metric("Memory Usage", f"{total_mb:.1f} MB")
         
-        # Warning if approaching limits
-        if len(st.session_state.documents) > 10:  # Warning for many documents
+        if len(st.session_state.documents) > 10:
             st.warning("⚠️ Many documents loaded. Consider removing some to improve performance.")
-        elif total_chars > 500000:  # Warning for very large content (500k chars ≈ 500KB)
+        elif total_chars > 500000:
             st.warning("⚠️ Very large document collection. Consider removing some documents to avoid processing limits.")
-        elif total_chars > 200000 and len(st.session_state.documents) > 3:  # Warning for medium-large multi-doc
+        elif total_chars > 200000 and len(st.session_state.documents) > 3:
             st.warning("⚠️ Large document collection. Consider removing some documents to avoid processing limits.")
         
-        # Show document summary
         with st.expander("📋 Document List"):
             for i, doc in enumerate(st.session_state.documents):
-                col1, col2 = st.columns([4, 1])
-                with col1:
+                cc1, cc2 = st.columns([4, 1])
+                with cc1:
                     st.markdown(f"**{i+1}. {doc['name']}** ({doc['type']}) - {doc['size']} chars")
-                with col2:
+                with cc2:
                     if st.button(f"🗑️", key=f"del_{i}", help=f"Delete {doc['name']}"):
-                        # Remove document from list
                         deleted_doc = st.session_state.documents.pop(i)
-                        # Remove from image_bytes if it was an image
                         if deleted_doc['type'] == 'image' and 'image_bytes' in st.session_state:
                             if isinstance(st.session_state.image_bytes, dict):
                                 st.session_state.image_bytes.pop(deleted_doc['name'], None)
                             else:
                                 st.session_state.image_bytes = {}
-                        
-                        # Clear all content and rebuild from remaining documents
                         rebuild_document_content()
                         st.rerun()
             
-            # Add reset button if there are documents
             if st.session_state.documents:
                 if st.button("🔄 Reset All Documents", type="secondary"):
                     clear_all_document_state()
                     st.rerun()
         
-        # Quick actions
+        # ---------- Quick actions ----------
         if st.session_state.documents:
             st.markdown("**Quick Actions:**")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
+            q1, q2 = st.columns(2)
+            with q1:
                 if st.button("🗑️ Clear Chat", help="Clear chat history but keep documents"):
                     st.session_state.chat_history = []
                     st.rerun()
-            with col2:
-                if st.button("🧹 Clear Small Docs", help="Remove documents under 1000 chars"):
-                    st.session_state.documents = [d for d in st.session_state.documents if d['size'] >= 1000]
-                    if st.session_state.documents:
-                        rebuild_document_content()
-                    else:
-                        clear_all_document_state()
-                    st.rerun()
-            with col3:
-                if st.button("📊 Document Stats", help="Show detailed document statistics"):
+            with q2:
+                if st.button("📊 Document Stats", help="Show dashboard with charts"):
                     st.session_state.show_stats = not st.session_state.get('show_stats', False)
                     st.rerun()
-            with col4:
-                if st.button("🐛 Debug Mode", help="Toggle debug information"):
-                    st.session_state.show_debug = not st.session_state.get('show_debug', False)
-                    st.rerun()
-        
-        # Show detailed statistics if requested
+
+        # ---------- DASHBOARD ----------
         if st.session_state.get('show_stats', False):
-            st.markdown("**📊 Detailed Document Statistics:**")
+            st.markdown("## 📊 Document Analytics Dashboard")
+
+            # Data agregat per dokumen
             stats_data = []
+            combined_texts = []
+            struct_total = {"text":0, "tables":0, "images":0}
             for doc in st.session_state.documents:
-                stats_data.append({
+                txt = doc['content'] or ""
+                combined_texts.append(txt)
+                ocr_q = _compute_ocr_quality(txt)
+                words = len(_tokenize(txt))
+                lines = len(txt.splitlines())
+                stt = {
                     "Document": doc['name'],
                     "Type": doc['type'],
                     "Size (chars)": doc['size'],
-                    "Size (KB)": f"{doc['size']/1024:.1f}",
-                    "Words": len(doc['content'].split()),
-                    "Lines": len(doc['content'].split('\n'))
-                })
-            
-            # Display as a nice table
-            for stat in stats_data:
-                st.markdown(f"**{stat['Document']}**")
-                st.markdown(f"  - Type: {stat['Type']} | Size: {stat['Size (chars)']:,} chars ({stat['Size (KB)']} KB)")
-                st.markdown(f"  - Words: {stat['Words']:,} | Lines: {stat['Lines']:,}")
-                st.markdown("---")
-        
-        # Debug section (only show if needed)
-        if st.session_state.get('show_debug', False):
-            with st.expander("🐛 Debug Info"):
-                st.markdown("**Current Session State:**")
-                st.markdown(f"- Documents count: {len(st.session_state.get('documents', []))}")
-                st.markdown(f"- OCR content length: {len(st.session_state.get('ocr_content', '') or '')}")
-                st.markdown(f"- Retrieval chunks: {len(st.session_state.get('retrieval_chunks', []) or [])}")
-                st.markdown(f"- Image bytes keys: {list(st.session_state.get('image_bytes', {}).keys())}")
-                st.markdown(f"- Chat history length: {len(st.session_state.get('chat_history', []))}")
-                
-                if st.button("🧹 Force Cleanup"):
-                    clear_all_document_state()
-                    st.rerun()
+                    "Words": words,
+                    "Lines": lines,
+                    "OCR Quality": round(ocr_q,1)
+                }
+                stats_data.append(stt)
+                s = _structure_stats(txt)
+                struct_total["text"] += s["text"]
+                struct_total["tables"] += s["tables"]
+                struct_total["images"] += s["images"]
 
+            combined = "\n\n".join(combined_texts)
+
+            st.dataframe(stats_data, use_container_width=True)
+
+            # -------- 1) Document Health --------
+            st.markdown("### Document Health")
+            dh1, dh2 = st.columns([1,1])
+            with dh1:
+                ocr_score = _compute_ocr_quality(combined)
+                fig_g = go.Figure(go.Indicator(
+                    mode="gauge+number",
+                    value=ocr_score,
+                    number={'suffix': " /100"},
+                    title={'text': "OCR Quality Score"},
+                    gauge={'axis': {'range': [0,100]},
+                           'bar': {'thickness': 0.3},
+                           'steps': [
+                               {'range': [0,50], 'color': "#fce4ec"},
+                               {'range': [50,75], 'color': "#fff3e0"},
+                               {'range': [75,100], 'color': "#e8f5e9"},
+                           ]}
+                ))
+                st.plotly_chart(fig_g, use_container_width=True)
+
+            with dh2:
+                labels = ["Text", "Tables", "Images"]
+                values = [max(1, struct_total["text"]), max(1, struct_total["tables"]), max(1, struct_total["images"])]
+                fig_donut = px.pie(values=values, names=labels, hole=0.6, title="Document Structure Overview")
+                st.plotly_chart(fig_donut, use_container_width=True)
+
+            secs = _extract_sections(combined)
+            sec_labels, cat_labels, mat = _missing_matrix(secs)
+            fig_heat = px.imshow(mat, aspect="auto", color_continuous_scale="Viridis",
+                                 labels=dict(x="Section", y="Missing Type", color="Count"),
+                                 x=sec_labels, y=cat_labels)
+            fig_heat.update_layout(title="Missing Data Heatmap")
+            st.plotly_chart(fig_heat, use_container_width=True)
+
+        # ---------- Chat history ----------
         for m in st.session_state.chat_history:
             role = "You" if m["role"] == "user" else "Assistant"
             st.markdown(f"**{role}:** {m['content']}")
 
-        user_q = st.text_input("Your question (can ask about specific documents or compare them):")
-        if st.button("Ask") and user_q:
+        # ---------- Q&A input (pakai form agar field auto kosong setelah submit) ----------
+        with st.form("qa_form_docs", clear_on_submit=True):
+            user_q = st.text_input(
+                "Your question (can ask about specific documents or compare them):",
+                key="qa_input"
+            )
+            submitted = st.form_submit_button("Ask")
+
+        if submitted and user_q:
             st.session_state.chat_history.append({"role": "user", "content": user_q})
             with st.spinner("Generating response..."):
                 if not google_api_key:
@@ -769,12 +952,18 @@ with col2:
                 else:
                     ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
             st.session_state.chat_history.append({"role": "assistant", "content": ans})
-            st.rerun()
+            st.rerun()  # field sudah kosong otomatis oleh form
+
     else:
         st.info("No documents processed yet. You can either upload files or just type a URL below and press Ask.")
-        user_q = st.text_input("Your question (you can also paste a URL first):")
-        if st.button("Ask") and user_q:
-            # If there is a URL in session and no content yet, try to process it first
+        with st.form("qa_form_nodocs", clear_on_submit=True):
+            user_q = st.text_input(
+                "Your question (can ask about specific documents or compare them):",
+                key="qa_input"
+            )
+            submitted = st.form_submit_button("Ask")
+
+        if submitted and user_q:
             url_candidate = st.session_state.get("url_input")
             if url_candidate and not st.session_state.get("ocr_content"):
                 with st.spinner("Processing URL before answering..."):
@@ -790,10 +979,9 @@ with col2:
                     else:
                         ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
                 st.session_state.chat_history.append({"role": "assistant", "content": ans})
-                st.rerun()
+                st.rerun()  # field sudah kosong otomatis oleh form
             else:
                 st.warning("Please provide a URL or upload a document first.")
-
 # Tampilkan konten hasil OCR/ekstraksi
 if st.session_state.get("documents"):
     with st.expander("📄 View All Document Contents"):
