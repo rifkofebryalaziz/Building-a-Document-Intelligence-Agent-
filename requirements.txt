@@ -4,3 +4,7 @@ google-generativeai
 python-dotenv
 pillow
 PyPDF2
+plotly
+numpy
+requests
+wordcloud
