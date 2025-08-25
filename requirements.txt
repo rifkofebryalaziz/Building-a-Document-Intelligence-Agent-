@@ -8,3 +8,4 @@ plotly
 numpy
 requests
 wordcloud
+docx2txt
