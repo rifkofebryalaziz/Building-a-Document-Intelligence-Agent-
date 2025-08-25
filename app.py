@@ -7,6 +7,8 @@ import time
 import numpy as np
 import re
 from urllib.parse import urljoin
+import pandas as pd
+import difflib  # fuzzy matching nama kolom
 
 # Mistral 0.4.2 (legacy client)
 from mistralai.client import MistralClient
@@ -21,6 +23,23 @@ import plotly.graph_objects as go
 from collections import Counter
 import json
 import string
+import subprocess
+
+# --- DOCX import with friendly error ---
+try:
+    # modul bernama "docx" disediakan oleh paket "python-docx"
+    from docx import Document  # pip install python-docx
+except Exception as e:
+    st.error(
+        "Paket yang benar untuk .docx adalah **python-docx**. "
+        "Sepertinya paket **docx** (yang salah) terpasang dan menyebabkan konflik.\n\n"
+        "Perbaikan cepat:\n"
+        "1) aktifkan venv\n"
+        "2) `pip uninstall -y docx`\n"
+        "3) `pip install --upgrade python-docx`\n\n"
+        f"Detail error: {e}"
+    )
+    raise
 
 # WordCloud opsional (fallback otomatis kalau belum terpasang)
 try:
@@ -245,6 +264,92 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     except Exception:
         return ""
 
+# --------------------- DOC/DOCX extractors -------------------------
+def extract_text_from_docx_bytes(docx_bytes: bytes) -> str:
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            tmp.write(docx_bytes)
+            tmp_path = tmp.name
+        doc = Document(tmp_path)
+        parts = []
+
+        # paragraphs
+        parts.extend(p.text for p in doc.paragraphs if p.text)
+
+        # tables (baris → Markdown)
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                cells = [c.text.strip().replace("\n", " ") for c in row.cells]
+                parts.append("| " + " | ".join(cells) + " |")
+
+        return "\n".join(parts).strip()
+    except Exception:
+        return ""
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+def extract_text_from_doc_bytes(doc_bytes: bytes) -> str:
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "in.doc")
+            with open(src, "wb") as f:
+                f.write(doc_bytes)
+
+            # unoconv -> txt
+            try:
+                subprocess.run(["unoconv", "-f", "txt", src], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                txt_path = src.replace(".doc", ".txt")
+                if os.path.exists(txt_path):
+                    with open(txt_path, "r", encoding="utf-8", errors="ignore") as t:
+                        return t.read()
+            except Exception:
+                pass
+
+            # soffice -> txt
+            try:
+                subprocess.run(
+                    ["soffice", "--headless", "--convert-to", "txt:Text", "--outdir", td, src],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                base = os.path.splitext(os.path.basename(src))[0]
+                txt_path = os.path.join(td, base + ".txt")
+                if os.path.exists(txt_path):
+                    with open(txt_path, "r", encoding="utf-8", errors="ignore") as t:
+                        return t.read()
+            except Exception:
+                pass
+
+            # soffice -> pdf -> extractor PDF / OCR Gemini
+            try:
+                subprocess.run(
+                    ["soffice", "--headless", "--convert-to", "pdf", "--outdir", td, src],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                pdf_path = os.path.join(td, "in.pdf")
+                if os.path.exists(pdf_path):
+                    with open(pdf_path, "rb") as pf:
+                        pdf_bytes = pf.read()
+                    txt = extract_text_from_pdf_bytes(pdf_bytes)
+                    if txt and len(txt) > 30:
+                        return txt
+                    return gemini_ocr_pdf(pdf_bytes, filename="converted_from_doc.pdf")
+            except Exception:
+                pass
+
+            # strings (last resort)
+            try:
+                out = subprocess.run(["strings", src], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                txt = out.stdout.decode("utf-8", errors="ignore")
+                return txt
+            except Exception:
+                return ""
+    except Exception:
+        return ""
+
+# --------------------- OCR helpers -------------------------
 def gemini_ocr_image(image_bytes: bytes) -> str:
     img = Image.open(io.BytesIO(image_bytes))
     prompt_doc = (
@@ -299,14 +404,38 @@ def gemini_ocr_pdf(pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
         except Exception:
             pass
 
+# --------------------- PDF/Image/DOC/DOCX pipeline -------------------------
 def process_document_with_gemini(kind: str, name: str, data: bytes) -> str:
     if kind == "pdf":
-        text = extract_text_from_pdf_bytes(data)
-        if len(text) >= 200:
-            return text
+        # 1) coba PyPDF2
+        raw_text = extract_text_from_pdf_bytes(data)
+        # deteksi sederhana apakah terlihat seperti tabel markdown
+        looks_like_table = bool(re.search(r'\|\s*[^|]+\s*\|', raw_text))
+        if len(raw_text) >= 200 and looks_like_table:
+            return raw_text
+        # 2) jika tidak terlihat tabel (atau pendek), paksa OCR Gemini (lebih bagus untuk tabel)
         return gemini_ocr_pdf(data, filename=name)
-    else:  # image
+
+    if kind == "image":
         return gemini_ocr_image(data)
+
+    if kind == "docx":
+        text = extract_text_from_docx_bytes(data)
+        if text and len(text) >= 50:
+            return text
+        # fallback minimal (tidak sebaik parser native)
+        return _generate_with_fallback([
+            "Extract the full content of this Office document as clean Markdown.",
+            data
+        ])
+
+    if kind == "doc":
+        text = extract_text_from_doc_bytes(data)
+        if text and len(text) >= 50:
+            return text
+        return "No content extracted from .doc (older Word). Please ensure LibreOffice/unoconv is installed for better results."
+
+    return "Unsupported document kind."
 
 def answer_from_image(image_bytes: bytes, question: str) -> str:
     try:
@@ -335,10 +464,6 @@ def generate_response(context: str, query: str) -> str:
                     return answer_from_image(img_bytes, query)
             first_img = next(iter(st.session_state.image_bytes.values()))
             return answer_from_image(first_img, query)
-        elif "image_bytes" in st.session_state:
-            return answer_from_image(st.session_state.image_bytes, query)
-        return "Error: Document context is empty or too short."
-    
     try:
         retrieved_chunks = _retrieve_top_k(query, k=5)
         if retrieved_chunks:
@@ -468,7 +593,7 @@ def _compute_ocr_quality(text: str) -> float:
     if not text: return 0.0
     n = len(text)
     good = sum(ch.isalnum() or ch.isspace() or ch in ".,:;-%()[]|/+\n" for ch in text)
-    bad = text.count("�")
+    bad = text.count(" ")
     short_lines = sum(1 for ln in text.splitlines() if 0 < len(ln.strip()) < 3)
     score = (good / n) * 100.0
     score -= min(25, bad * 0.5)
@@ -656,14 +781,306 @@ def _ner_counts_naive(text: str):
     return {"ORG": ORG, "PERSON": PERSON, "LOC": LOC}
 
 
+# ======================= TABLE PARSER & AVG INTENT =======================
+_TABLE_ROW_RE = re.compile(r'^\s*\|(.+)\|\s*$')
+_TABLE_SEP_RE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$')
+
+def _parse_markdown_tables(md_text: str) -> list:
+    """
+    Mengembalikan list of (DataFrame, meta) dari tabel Markdown di teks.
+    Meta: {"doc_section": str, "table_index": int}
+    Mencoba infer header saat tidak ada header eksplisit.
+    """
+    tables = []
+    lines = md_text.splitlines()
+    buf = []
+
+    def _flush(buf_lines, t_idx):
+        if not buf_lines:
+            return
+        rows = []
+        for ln in buf_lines:
+            m = _TABLE_ROW_RE.match(ln)
+            if not m:
+                continue
+            cells = [c.strip() for c in m.group(1).split('|')]
+            rows.append(cells)
+
+        if not rows:
+            return
+
+        # Header detection:
+        header = None
+        if len(rows) >= 2 and _TABLE_SEP_RE.match(buf_lines[1]):  # header | sep | data...
+            header = [h if h else f"col_{i+1}" for i, h in enumerate(rows[0])]
+            data = rows[2:] if len(rows) > 2 else []
+        else:
+            # Coba infer: jika baris pertama lebih "tekstual" → header
+            first = rows[0]
+            nonnum = sum(1 for x in first if not re.fullmatch(r'[-+]?\d+([.,]\d+)?', (x or '')))
+            if nonnum >= max(1, len(first) // 2):
+                header = [h if h else f"col_{i+1}" for i, h in enumerate(first)]
+                data = rows[1:]
+            else:
+                ncol = len(first)
+                header = [f"col_{i+1}" for i in range(ncol)]
+                data = rows
+
+        # Normalisasi panjang baris
+        maxc = len(header)
+        norm_rows = []
+        for r in data:
+            if len(r) < maxc:
+                r = r + [''] * (maxc - len(r))
+            elif len(r) > maxc:
+                r = r[:maxc]
+            norm_rows.append(r)
+
+        try:
+            df = pd.DataFrame(norm_rows, columns=header)
+            tables.append((df, {"doc_section": "All", "table_index": t_idx}))
+        except Exception:
+            pass
+
+    t_idx = 0
+    for ln in lines:
+        if _TABLE_ROW_RE.match(ln):
+            buf.append(ln)
+        else:
+            if buf:
+                _flush(buf, t_idx)
+                t_idx += 1
+                buf = []
+    if buf:
+        _flush(buf, t_idx)
+
+    return tables
+
+def _is_avg_intent(q: str) -> bool:
+    ql = q.lower()
+    keys = ["rata rata", "rata-rata", "average", "avg", "mean"]
+    return any(k in ql for k in keys)
+
+def _extract_target_column_terms(q: str) -> list:
+    # Dalam tanda kutip
+    quoted = re.findall(r'["“”](.+?)["“”]', q)
+    terms = [t.strip() for t in quoted if t.strip()]
+    # Setelah kata kunci
+    m = re.search(r'\b(kolom|column|field)\s+([A-Za-z0-9_\-\s]+)', q, re.I)
+    if m:
+        chunk = m.group(2).strip()
+        chunk = re.split(r'[,.;:?]|rata|average|mean', chunk, 1)[0].strip()
+        if chunk:
+            terms.append(chunk)
+    # Fallback
+    toks = _tokenize(q)
+    toks = [t for t in toks if t not in {"rata", "rata-rata", "average", "mean", "avg", "nilai", "value"}]
+    if toks:
+        terms.append(max(toks, key=len))
+    seen = set(); res = []
+    for t in terms:
+        tt = t.lower()
+        if tt not in seen:
+            seen.add(tt); res.append(t)
+    return res[:3]
+
+def _normalize_col(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r'\s+', ' ', s)
+    s = s.replace('_', ' ')
+    return s
+
+def _guess_best_column(df: pd.DataFrame, query: str) -> str | None:
+    if df.empty or df.shape[1] == 0:
+        return None
+    colmap = {c: _normalize_col(c) for c in df.columns}
+    terms = _extract_target_column_terms(query)
+    synonyms = {
+        "harga": ["price", "amount", "nilai", "nominal", "jumlah"],
+        "pendapatan": ["revenue", "sales", "omzet"],
+        "laba": ["profit", "net profit", "laba bersih", "income"],
+        "tanggal": ["date", "periode", "period", "bulan", "month", "year", "tahun"],
+        "qty": ["quantity", "jumlah", "kuantitas", "volume"],
+    }
+    candidates = []
+    for t in terms:
+        nt = _normalize_col(t)
+        for orig, norm in colmap.items():
+            if nt == norm or nt in norm or norm in nt:
+                candidates.append(orig)
+        close = difflib.get_close_matches(nt, list(colmap.values()), n=1, cutoff=0.75)
+        if close:
+            for orig, norm in colmap.items():
+                if norm == close[0]:
+                    candidates.append(orig)
+        for base, syns in synonyms.items():
+            if nt == base or nt in syns:
+                close2 = difflib.get_close_matches(base, list(colmap.values()), n=1, cutoff=0.6)
+                if close2:
+                    for orig, norm in colmap.items():
+                        if norm == close2[0]:
+                            candidates.append(orig)
+    for c in candidates:
+        s = pd.to_numeric(
+            df[c].astype(str)
+                .str.replace(r'[^\d\-\.,]', '', regex=True)
+                .str.replace('.', '', regex=False)
+                .str.replace(',', '.', regex=False),
+            errors='coerce'
+        )
+        if s.notna().sum() >= max(2, int(len(s)*0.5)):
+            return c
+    best_col = None; best_score = -1
+    for c in df.columns:
+        s = pd.to_numeric(
+            df[c].astype(str)
+                .str.replace(r'[^\d\-\.,]', '', regex=True)
+                .str.replace('.', '', regex=False)
+                .str.replace(',', '.', regex=False),
+            errors='coerce'
+        )
+        score = s.notna().sum()
+        if score > best_score:
+            best_score = score; best_col = c
+    return best_col
+
+# --------- NEW: Fallback parser nilai dari teks polos ---------
+def _to_float_id_en(num: str) -> float | None:
+    if not num:
+        return None
+    s = num.strip()
+    if "." in s and "," in s:
+        if s.find(".") < s.find(","):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    else:
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        try:
+            digits = re.sub(r"[^\d\.\-]", "", s)
+            return float(digits) if digits else None
+        except Exception:
+            return None
+
+def _extract_scores_from_text(text: str) -> list[float]:
+    """
+    Fallback untuk dokumen ranking seperti contoh:
+    '... 22090098 NAMA 93,7 089670916052 ...'
+    Strategi:
+      1) Cari angka 0..100 yang diikuti nomor HP -> (score, phone)
+      2) Atau pola 'rank nim nama score' -> ambil score
+      3) Atau angka di dekat kata 'nilai'
+    """
+    scores: list[float] = []
+    t = " ".join(text.split())  # rapikan spasi
+
+    # 1) Angka sebelum nomor HP (0xxxxxxxxxx…)
+    p_phone = re.compile(r'(\d{1,3}(?:[.,]\d{1,2})?)\s+(0\d{9,13})')
+    for m in p_phone.finditer(t):
+        val = _to_float_id_en(m.group(1))
+        if val is not None and 0 <= val <= 100:
+            scores.append(val)
+
+    # 2) 'rank nim nama score'
+    p_rank = re.compile(
+        r'\b\d{1,3}\s+(?:\d{8,12})\s+[A-Za-zÀ-ÿ\.\'\- ]{2,}?'
+        r'\s+(\d{1,3}(?:[.,]\d{1,2})?)\b'
+    )
+    for m in p_rank.finditer(t):
+        val = _to_float_id_en(m.group(1))
+        if val is not None and 0 <= val <= 100:
+            scores.append(val)
+
+    # 3) Di dekat kata "nilai"
+    if not scores:
+        near = []
+        for m in re.finditer(r'(nilai[^0-9]{0,30})(\d{1,3}(?:[.,]\d{1,2})?)', t, flags=re.I):
+            val = _to_float_id_en(m.group(2))
+            if val is not None and 0 <= val <= 100:
+                near.append(val)
+        if len(near) >= 3:
+            scores.extend(near)
+
+    # Dedup ringan
+    if scores:
+        seen = set(); uniq = []
+        for v in scores:
+            key = round(v, 2)
+            if key not in seen:
+                seen.add(key); uniq.append(v)
+        scores = uniq
+
+    return scores
+
+def compute_average_from_docs(query: str, documents: list) -> dict | None:
+    """
+    Jika pertanyaan berniat menghitung rata-rata:
+    - Coba dari tabel Markdown
+    - Jika tidak ada tabel cocok, fallback: parsing teks polos
+    Return:
+      {'value': float, 'column': str, 'doc': str, 'table_index': int, 'n': int}
+    """
+    if not _is_avg_intent(query):
+        return None
+
+    best = None
+
+    # 1) Coba dari tabel Markdown
+    for doc in documents:
+        content = doc.get("content") or ""
+        tables = _parse_markdown_tables(content)
+        for df, meta in tables:
+            if df.empty:
+                continue
+            col = _guess_best_column(df, query)
+            if not col:
+                continue
+            s = pd.to_numeric(
+                df[col].astype(str)
+                      .str.replace(r'[^\d\-\.,]', '', regex=True)
+                      .str.replace('.', '', regex=False)
+                      .str.replace(',', '.', regex=False),
+                errors='coerce'
+            )
+            vals = s.dropna()
+            if len(vals) == 0:
+                continue
+            mean_val = float(vals.mean())
+            cand = {"value": mean_val, "column": col, "doc": doc["name"],
+                    "table_index": meta.get("table_index", 0), "n": int(len(vals))}
+            if (best is None) or (cand["n"] > best["n"]):
+                best = cand
+
+    # 2) Fallback: teks polos
+    if best is None or best["n"] < 3:
+        for doc in documents:
+            content = doc.get("content") or ""
+            scores = _extract_scores_from_text(content)
+            if len(scores) >= 3:
+                mean_val = float(np.mean(scores))
+                cand = {"value": mean_val,
+                        "column": "Nilai (fallback)",
+                        "doc": doc["name"],
+                        "table_index": -1,
+                        "n": int(len(scores))}
+                if (best is None) or (cand["n"] > best["n"]):
+                    best = cand
+
+    return best
+
+
 # --------------------- UI Layout -----------------------
 col1, col2 = st.columns([1, 1])
 
 with col1:
     st.header("Document Upload")
     uploaded_files = st.file_uploader(
-        "Upload multiple documents (DOC, PDF, PNG, JPG, JPEG)",
-        type=["pdf", "png", "jpg", "jpeg"],
+        "Upload multiple documents (DOC, DOCX, PDF, PNG, JPG, JPEG)",
+        type=["pdf", "png", "jpg", "jpeg", "doc", "docx"],
         accept_multiple_files=True,
     )
     url_input = st.text_input("Or enter a URL (web page or document):")
@@ -694,17 +1111,32 @@ with col1:
             clean_url = url.split("?")[0]
             ext = os.path.splitext(clean_url)[1].lower()
             data = r.content
+
+            # signature
             is_pdf_sig = data[:4] == b"%PDF"
             is_png_sig = data[:8] == b"\x89PNG\r\n\x1a\n"
             is_jpg_sig = data[:3] == b"\xff\xd8\xff"
+
+            # Detect Office CT
+            is_docx_ct = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in content_type
+            is_doc_ct = "application/msword" in content_type
+
             chosen_kind = None
             if is_pdf_sig or "pdf" in content_type or ext == ".pdf":
                 chosen_kind = "pdf"
             elif is_png_sig or is_jpg_sig or any(img_ct in content_type for img_ct in ["image/png", "image/jpeg", "image/jpg"]) or ext in [".png", ".jpg", ".jpeg"]:
                 chosen_kind = "image"
+            elif ext == ".docx" or is_docx_ct:
+                chosen_kind = "docx"
+            elif ext == ".doc" or is_doc_ct:
+                chosen_kind = "doc"
+
             if not chosen_kind and content_type.startswith("text/html"):
                 html_text = r.text
-                links = re.findall(r'href=[\"\']([^\"\']+\.(?:pdf|png|jpe?g))(?:[\#\?][^\"\']*)?[\"\']', html_text, flags=re.IGNORECASE)
+                links = re.findall(
+                    r'href=["\']([^"\']+\.(?:pdf|png|jpe?g|docx?|DOCX?))(?:[#\?][^"\']*)?["\']',
+                    html_text, flags=re.IGNORECASE
+                )
                 if links:
                     target_url = urljoin(url, links[0])
                     rr = requests.get(
@@ -718,15 +1150,19 @@ with col1:
                     rr.raise_for_status()
                     target_ct = rr.headers.get("Content-Type", "").lower()
                     tdata = rr.content
-                    if tdata[:4] == b"%PDF" or "pdf" in target_ct:
-                        chosen_kind = "pdf"
-                        data = tdata
-                        clean_url = target_url.split("?")[0]
-                    elif tdata[:8] == b"\x89PNG\r\n\x1a\n" or tdata[:3] == b"\xff\xd8\xff" or any(ic in target_ct for ic in ["image/png", "image/jpeg", "image/jpg"]):
-                        chosen_kind = "image"
-                        data = tdata
-                        clean_url = target_url.split("?")[0]
+                    t_clean = target_url.split("?")[0]
+                    t_ext = os.path.splitext(t_clean)[1].lower()
+
+                    if tdata[:4] == b"%PDF" or "pdf" in target_ct or t_ext == ".pdf":
+                        chosen_kind = "pdf"; data = tdata; clean_url = t_clean
+                    elif tdata[:8] == b"\x89PNG\r\n\x1a\n" or tdata[:3] == b"\xff\xd8\xff" or any(ic in target_ct for ic in ["image/png","image/jpeg","image/jpg"]) or t_ext in [".png",".jpg",".jpeg"]:
+                        chosen_kind = "image"; data = tdata; clean_url = t_clean
                         st.session_state.image_bytes = data
+                    elif t_ext == ".docx" or "vnd.openxmlformats-officedocument.wordprocessingml.document" in target_ct:
+                        chosen_kind = "docx"; data = tdata; clean_url = t_clean
+                    elif t_ext == ".doc" or "application/msword" in target_ct:
+                        chosen_kind = "doc"; data = tdata; clean_url = t_clean
+
                 if not chosen_kind:
                     stripped = re.sub(r"<script[\s\S]*?</script>", " ", html_text, flags=re.IGNORECASE)
                     stripped = re.sub(r"<style[\s\S]*?</style>", " ", stripped, flags=re.IGNORECASE)
@@ -737,8 +1173,10 @@ with col1:
                         _build_retrieval_index(st.session_state.ocr_content)
                         return True, "Webpage processed as text."
                     return False, "No content extracted from webpage."
+
             if not chosen_kind:
                 return False, f"Unsupported content type: {content_type or ext}"
+
             st.session_state.ocr_content = process_document_with_gemini(
                 chosen_kind, os.path.basename(clean_url) or "download", data
             )
@@ -760,12 +1198,26 @@ with col1:
                 for uploaded_file in uploaded_files:
                     try:
                         ext = os.path.splitext(uploaded_file.name)[1].lower()
-                        kind = "pdf" if ext == ".pdf" else "image"
+                        if ext == ".pdf":
+                            kind = "pdf"
+                        elif ext in [".png", ".jpg", ".jpeg"]:
+                            kind = "image"
+                        elif ext == ".docx":
+                            kind = "docx"
+                        elif ext == ".doc":
+                            kind = "doc"
+                        else:
+                            kind = "unknown"
+
                         if kind == "image":
                             if "image_bytes" not in st.session_state:
                                 st.session_state.image_bytes = {}
                             st.session_state.image_bytes[uploaded_file.name] = uploaded_file.getvalue()
                         
+                        if kind == "unknown":
+                            st.warning(f"Unsupported file type for {uploaded_file.name}. Skipped.")
+                            continue
+
                         content = process_document_with_gemini(
                             kind, uploaded_file.name, uploaded_file.getvalue()
                         )
@@ -893,15 +1345,13 @@ with col2:
                 struct_total["tables"] += s["tables"]
                 struct_total["images"] += s["images"]
 
-            combined = "\n\n".join(combined_texts)
-
             st.dataframe(stats_data, use_container_width=True)
 
             # -------- 1) Document Health --------
             st.markdown("### Document Health")
             dh1, dh2 = st.columns([1,1])
             with dh1:
-                ocr_score = _compute_ocr_quality(combined)
+                ocr_score = _compute_ocr_quality("\n\n".join(combined_texts))
                 fig_g = go.Figure(go.Indicator(
                     mode="gauge+number",
                     value=ocr_score,
@@ -923,7 +1373,7 @@ with col2:
                 fig_donut = px.pie(values=values, names=labels, hole=0.6, title="Document Structure Overview")
                 st.plotly_chart(fig_donut, use_container_width=True)
 
-            secs = _extract_sections(combined)
+            secs = _extract_sections("\n\n".join(combined_texts))
             sec_labels, cat_labels, mat = _missing_matrix(secs)
             fig_heat = px.imshow(mat, aspect="auto", color_continuous_scale="Viridis",
                                  labels=dict(x="Section", y="Missing Type", color="Count"),
@@ -936,7 +1386,7 @@ with col2:
             role = "You" if m["role"] == "user" else "Assistant"
             st.markdown(f"**{role}:** {m['content']}")
 
-        # ---------- Q&A input (pakai form agar field auto kosong setelah submit) ----------
+        # ---------- Q&A input ----------
         with st.form("qa_form_docs", clear_on_submit=True):
             user_q = st.text_input(
                 "Your question (can ask about specific documents or compare them):",
@@ -947,10 +1397,35 @@ with col2:
         if submitted and user_q:
             st.session_state.chat_history.append({"role": "user", "content": user_q})
             with st.spinner("Generating response..."):
-                if not google_api_key:
-                    ans = "Please provide a valid Google API Key."
-                else:
-                    ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
+                ans = None
+                # 1) Coba hitung rata-rata dari tabel lokal / fallback teks
+                try:
+                    avg_res = compute_average_from_docs(user_q, st.session_state.documents)
+                except Exception:
+                    avg_res = None
+                if avg_res:
+                    # Format Indonesia (koma desimal)
+                    val_str = f"{avg_res['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                    if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                        ans = (
+                            f"Rata-rata untuk kolom **{avg_res['column']}** adalah **{val_str}** "
+                            f"(n={avg_res['n']}), dihitung dari "
+                            + (f"tabel #{avg_res['table_index']+1} di " if avg_res['table_index'] >= 0 else "")
+                            + f"dokumen **{avg_res['doc']}**."
+                        )
+                    else:
+                        ans = (
+                            f"The average for column **{avg_res['column']}** is **{val_str}** "
+                            f"(n={avg_res['n']}), computed "
+                            + (f"from table #{avg_res['table_index']+1} in " if avg_res['table_index'] >= 0 else "from ")
+                            + f"document **{avg_res['doc']}**."
+                        )
+                # 2) Fallback RAG
+                if not ans:
+                    if not google_api_key:
+                        ans = "Please provide a valid Google API Key."
+                    else:
+                        ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
             st.session_state.chat_history.append({"role": "assistant", "content": ans})
             st.rerun()  # field sudah kosong otomatis oleh form
 
@@ -974,14 +1449,37 @@ with col2:
             if st.session_state.get("ocr_content"):
                 st.session_state.chat_history.append({"role": "user", "content": user_q})
                 with st.spinner("Generating response..."):
-                    if not google_api_key:
-                        ans = "Please provide a valid Google API Key."
-                    else:
-                        ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
+                    ans = None
+                    try:
+                        avg_res = compute_average_from_docs(user_q, st.session_state.documents)
+                    except Exception:
+                        avg_res = None
+                    if avg_res:
+                        val_str = f"{avg_res['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                        if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                            ans = (
+                                f"Rata-rata untuk kolom **{avg_res['column']}** adalah **{val_str}** "
+                                f"(n={avg_res['n']}), dihitung dari "
+                                + (f"tabel #{avg_res['table_index']+1} di " if avg_res['table_index'] >= 0 else "")
+                                + f"dokumen **{avg_res['doc']}**."
+                            )
+                        else:
+                            ans = (
+                                f"The average for column **{avg_res['column']}** is **{val_str}** "
+                                f"(n={avg_res['n']}), computed "
+                                + (f"from table #{avg_res['table_index']+1} in " if avg_res['table_index'] >= 0 else "from ")
+                                + f"document **{avg_res['doc']}**."
+                            )
+                    if not ans:
+                        if not google_api_key:
+                            ans = "Please provide a valid Google API Key."
+                        else:
+                            ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
                 st.session_state.chat_history.append({"role": "assistant", "content": ans})
                 st.rerun()  # field sudah kosong otomatis oleh form
             else:
                 st.warning("Please provide a URL or upload a document first.")
+
 # Tampilkan konten hasil OCR/ekstraksi
 if st.session_state.get("documents"):
     with st.expander("📄 View All Document Contents"):
