@@ -506,7 +506,6 @@ Respond in English concisely. If the answer is not in the context, say so. If th
 def generate_with_mistral_fallback(prompt: str) -> str:
     if not mistral_client:
         return "Error: No Mistral API key configured for fallback."
-    
     try:
         response = mistral_client.chat(
             model="mistral-large-latest",
@@ -944,7 +943,7 @@ def _guess_best_column(df: pd.DataFrame, query: str) -> str | None:
             best_score = score; best_col = c
     return best_col
 
-# --------- NEW: Fallback parser nilai dari teks polos ---------
+# --------- Fallback parser nilai dari teks polos ---------
 def _to_float_id_en(num: str) -> float | None:
     if not num:
         return None
@@ -1016,23 +1015,53 @@ def _extract_scores_from_text(text: str) -> list[float]:
 
     return scores
 
-def compute_average_from_docs(query: str, documents: list) -> dict | None:
+# ========== BARU: pilih dokumen berdasar pertanyaan ==========
+def _normalize_filename(name: str) -> str:
+    base = os.path.splitext(name)[0]
+    base = re.sub(r'[^a-zA-Z0-9]+', ' ', base).strip().lower()
+    return base
+
+def select_docs_for_query(query: str, documents: list) -> list:
     """
-    Jika pertanyaan berniat menghitung rata-rata:
-    - Coba dari tabel Markdown
-    - Jika tidak ada tabel cocok, fallback: parsing teks polos
-    Return:
-      {'value': float, 'column': str, 'doc': str, 'table_index': int, 'n': int}
+    Jika user menyebutkan nama file (tanpa ekstensi) pada pertanyaan,
+    kembalikan hanya dokumen yang disebut. Jika tidak ada yang match, kembalikan semua.
+    """
+    q = query.lower()
+    matches = []
+    for d in documents:
+        norm = _normalize_filename(d["name"])
+        # match frasa penuh atau sebagian (split ke kata-kata unik)
+        if norm and norm in q:
+            matches.append(d)
+        else:
+            tokens = [t for t in norm.split() if len(t) > 2]
+            hit = sum(1 for t in tokens if t in q)
+            if hit >= max(1, len(tokens)//2):
+                matches.append(d)
+    if len(matches) == 1:
+        return matches
+    if len(matches) >= 2:
+        return matches
+    return documents
+
+# ========== MODIFIED: hitung rata-rata per dokumen ==========
+def compute_average_per_doc(query: str, documents: list) -> list[dict]:
+    """
+    Hitung rata-rata kolom target di tiap dokumen.
+    Return list of dict: [{'doc':..., 'column':..., 'value':..., 'n':...}, ...]
     """
     if not _is_avg_intent(query):
-        return None
+        return []
 
-    best = None
+    results = []
 
-    # 1) Coba dari tabel Markdown
     for doc in documents:
         content = doc.get("content") or ""
         tables = _parse_markdown_tables(content)
+
+        best = None
+
+        # --- cari di tabel markdown ---
         for df, meta in tables:
             if df.empty:
                 continue
@@ -1041,36 +1070,33 @@ def compute_average_from_docs(query: str, documents: list) -> dict | None:
                 continue
             s = pd.to_numeric(
                 df[col].astype(str)
-                      .str.replace(r'[^\d\-\.,]', '', regex=True)
-                      .str.replace('.', '', regex=False)
-                      .str.replace(',', '.', regex=False),
+                    .str.replace(r'[^\d\-\.,]', '', regex=True)
+                    .str.replace('.', '', regex=False)
+                    .str.replace(',', '.', regex=False),
                 errors='coerce'
             )
             vals = s.dropna()
             if len(vals) == 0:
                 continue
             mean_val = float(vals.mean())
-            cand = {"value": mean_val, "column": col, "doc": doc["name"],
-                    "table_index": meta.get("table_index", 0), "n": int(len(vals))}
+            cand = {"doc": doc["name"], "column": col,
+                    "value": mean_val, "n": int(len(vals))}
             if (best is None) or (cand["n"] > best["n"]):
                 best = cand
 
-    # 2) Fallback: teks polos
-    if best is None or best["n"] < 3:
-        for doc in documents:
-            content = doc.get("content") or ""
+        # --- fallback dari teks polos ---
+        if best is None or best["n"] < 3:
             scores = _extract_scores_from_text(content)
             if len(scores) >= 3:
                 mean_val = float(np.mean(scores))
-                cand = {"value": mean_val,
-                        "column": "Nilai (fallback)",
-                        "doc": doc["name"],
-                        "table_index": -1,
-                        "n": int(len(scores))}
-                if (best is None) or (cand["n"] > best["n"]):
-                    best = cand
+                cand = {"doc": doc["name"], "column": "Nilai (fallback)",
+                        "value": mean_val, "n": int(len(scores))}
+                best = cand
 
-    return best
+        if best:
+            results.append(best)
+
+    return results
 
 
 # --------------------- UI Layout -----------------------
@@ -1398,29 +1424,35 @@ with col2:
             st.session_state.chat_history.append({"role": "user", "content": user_q})
             with st.spinner("Generating response..."):
                 ans = None
-                # 1) Coba hitung rata-rata dari tabel lokal / fallback teks
                 try:
-                    avg_res = compute_average_from_docs(user_q, st.session_state.documents)
+                    # pilih dokumen berdasar apakah user menyebut nama file
+                    docs_to_use = select_docs_for_query(user_q, st.session_state.documents)
+                    avg_results = compute_average_per_doc(user_q, docs_to_use)
                 except Exception:
-                    avg_res = None
-                if avg_res:
-                    # Format Indonesia (koma desimal)
-                    val_str = f"{avg_res['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
-                    if ANSWER_LANGUAGE == "Bahasa Indonesia":
-                        ans = (
-                            f"Rata-rata untuk kolom **{avg_res['column']}** adalah **{val_str}** "
-                            f"(n={avg_res['n']}), dihitung dari "
-                            + (f"tabel #{avg_res['table_index']+1} di " if avg_res['table_index'] >= 0 else "")
-                            + f"dokumen **{avg_res['doc']}**."
-                        )
+                    avg_results = []
+
+                if avg_results:
+                    if len(avg_results) == 1:
+                        r = avg_results[0]
+                        val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                        if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                            ans = f"Rata-rata di dokumen **{r['doc']}** untuk kolom **{r['column']}** adalah **{val_str}** (n={r['n']})."
+                        else:
+                            ans = f"The average in document **{r['doc']}** for column **{r['column']}** is **{val_str}** (n={r['n']})."
                     else:
-                        ans = (
-                            f"The average for column **{avg_res['column']}** is **{val_str}** "
-                            f"(n={avg_res['n']}), computed "
-                            + (f"from table #{avg_res['table_index']+1} in " if avg_res['table_index'] >= 0 else "from ")
-                            + f"document **{avg_res['doc']}**."
-                        )
-                # 2) Fallback RAG
+                        # tampilkan semua dan bandingkan
+                        ans_lines = []
+                        for r in avg_results:
+                            val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                            ans_lines.append(f"- **{r['doc']}** → {val_str} (n={r['n']})")
+                        best = max(avg_results, key=lambda x: x["value"])
+                        if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                            ans = "Hasil rata-rata per dokumen:\n" + "\n".join(ans_lines)
+                            ans += f"\n\n📊 Nilai tertinggi ada di **{best['doc']}** dengan rata-rata {best['value']:.2f}."
+                        else:
+                            ans = "Average per document:\n" + "\n".join(ans_lines)
+                            ans += f"\n\n📊 Highest is in **{best['doc']}** with average {best['value']:.2f}."
+                # 2) Fallback RAG jika bukan intent rata-rata / gagal parsing
                 if not ans:
                     if not google_api_key:
                         ans = "Please provide a valid Google API Key."
@@ -1451,25 +1483,30 @@ with col2:
                 with st.spinner("Generating response..."):
                     ans = None
                     try:
-                        avg_res = compute_average_from_docs(user_q, st.session_state.documents)
+                        docs_to_use = select_docs_for_query(user_q, st.session_state.documents)
+                        avg_results = compute_average_per_doc(user_q, docs_to_use)
                     except Exception:
-                        avg_res = None
-                    if avg_res:
-                        val_str = f"{avg_res['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
-                        if ANSWER_LANGUAGE == "Bahasa Indonesia":
-                            ans = (
-                                f"Rata-rata untuk kolom **{avg_res['column']}** adalah **{val_str}** "
-                                f"(n={avg_res['n']}), dihitung dari "
-                                + (f"tabel #{avg_res['table_index']+1} di " if avg_res['table_index'] >= 0 else "")
-                                + f"dokumen **{avg_res['doc']}**."
-                            )
+                        avg_results = []
+                    if avg_results:
+                        if len(avg_results) == 1:
+                            r = avg_results[0]
+                            val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                            if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                                ans = f"Rata-rata di dokumen **{r['doc']}** untuk kolom **{r['column']}** adalah **{val_str}** (n={r['n']})."
+                            else:
+                                ans = f"The average in document **{r['doc']}** for column **{r['column']}** is **{val_str}** (n={r['n']})."
                         else:
-                            ans = (
-                                f"The average for column **{avg_res['column']}** is **{val_str}** "
-                                f"(n={avg_res['n']}), computed "
-                                + (f"from table #{avg_res['table_index']+1} in " if avg_res['table_index'] >= 0 else "from ")
-                                + f"document **{avg_res['doc']}**."
-                            )
+                            ans_lines = []
+                            for r in avg_results:
+                                val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                                ans_lines.append(f"- **{r['doc']}** → {val_str} (n={r['n']})")
+                            best = max(avg_results, key=lambda x: x["value"])
+                            if ANSWER_LANGUAGE == "Bahasa Indonesia":
+                                ans = "Hasil rata-rata per dokumen:\n" + "\n".join(ans_lines)
+                                ans += f"\n\n📊 Nilai tertinggi ada di **{best['doc']}** dengan rata-rata {best['value']:.2f}."
+                            else:
+                                ans = "Average per document:\n" + "\n".join(ans_lines)
+                                ans += f"\n\n📊 Highest is in **{best['doc']}** with average {best['value']:.2f}."
                     if not ans:
                         if not google_api_key:
                             ans = "Please provide a valid Google API Key."
