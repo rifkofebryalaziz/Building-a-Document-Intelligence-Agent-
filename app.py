@@ -29,6 +29,8 @@ import subprocess
 try:
     # modul bernama "docx" disediakan oleh paket "python-docx"
     from docx import Document  # pip install python-docx
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
 except Exception as e:
     st.error(
         "Paket yang benar untuk .docx adalah **python-docx**. "
@@ -52,8 +54,20 @@ except Exception:
 # --------------------- Page config ---------------------
 st.set_page_config(page_title="Document Intelligence Agent", layout="wide")
 st.title("Document Intelligence Agent")
-st.markdown("Upload documents or URL to extract information and ask questions")
+st.caption("Upload documents or URL → extract, render (DOCX tables preserved), and ask questions.")
 
+# --------------------- Global CSS (stabilkan tabel DOCX) ---------------------
+st.markdown("""
+<style>
+.docx-table { width:100%; border-collapse:collapse; table-layout:fixed; margin:8px 0; }
+.docx-table col { }
+.docx-table th, .docx-table td {
+  border:1px solid #ccc; padding:6px; vertical-align:top;
+  white-space:pre-wrap; word-break:keep-all; overflow-wrap:anywhere;
+}
+.docx-table th { font-weight:700; }
+</style>
+""", unsafe_allow_html=True)
 
 # --------------------- Sidebar: API Keys ----------------
 with st.sidebar:
@@ -81,7 +95,6 @@ with st.sidebar:
 - **Google API Key (Gemini)** — [YouTube Tutorial](https://youtu.be/IHj7wF-8ry8?si=VKvhMM3pMeKwkXAv)
         """
     )
-
 
 # Disimpan global agar helper bisa akses
 MODEL_PREFERENCE = model_preference
@@ -264,25 +277,211 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     except Exception:
         return ""
 
+# ===== DOCX → HTML (preserve tables, colspan/rowspan, basic styles) =====
+from html import escape
+
+def _run_to_html(run):
+    text = escape(run.text or "")
+    if not text:
+        return ""
+    if run.bold:
+        text = f"<strong>{text}</strong>"
+    if run.italic:
+        text = f"<em>{text}</em>"
+    if run.underline:
+        text = f"<u>{text}</u>"
+    return text
+
+def _para_to_html(para):
+    align = getattr(para.paragraph_format, "alignment", None)
+    align_map = {0:"left", 1:"center", 2:"right", 3:"justify"}  # WD_ALIGN_PARAGRAPH
+    style = ""
+    if align is not None:
+        style = f' style="text-align:{align_map.get(int(align), "left")};"'
+    content = "".join(_run_to_html(r) for r in para.runs)
+    return f"<p{style}>{content}</p>"
+
+def _get_tblgrid_widths(table):
+    """Ambil lebar kolom dari w:tblGrid/w:gridCol[@w:w] (dalam twips)."""
+    try:
+        grid = table._tbl.tblGrid
+        if grid is None:
+            max_cols = max(len(r.cells) for r in table.rows) if table.rows else 0
+            return [1]*max_cols
+        widths = []
+        for gc in grid.iterchildren():
+            if gc.tag.endswith('gridCol'):
+                w = gc.get(qn('w:w'))
+                widths.append(int(w) if w else 1)
+        return widths if widths else [1]
+    except Exception:
+        max_cols = max(len(r.cells) for r in table.rows) if table.rows else 0
+        return [1]*max_cols
+
+def _cell_gridspan(cell) -> int:
+    try:
+        tcPr = cell._tc.tcPr
+        if tcPr is not None and tcPr.gridSpan is not None:
+            return int(tcPr.gridSpan.val)
+    except Exception:
+        pass
+    return 1
+
+def _cell_vmerge_state(cell) -> str | None:
+    """
+    return 'restart' | 'continue' | None
+    """
+    try:
+        tcPr = cell._tc.tcPr
+        if tcPr is None or tcPr.vMerge is None:
+            return None
+        v = tcPr.vMerge.val
+        if v in (None, 'continue'):
+            return 'continue'
+        if v == 'restart':
+            return 'restart'
+        return 'continue'
+    except Exception:
+        return None
+
+def _row_vrowspans(table):
+    """
+    Untuk setiap cell, kembalikan num rowspan efektif:
+      - 0  → vMerge continue (jangan render)
+      - >=1 → render di baris ini dengan rowspan tsb
+    """
+    n_rows = len(table.rows)
+    result = []
+    for r in range(n_rows):
+        row = table.rows[r]
+        arr = []
+        for c, cell in enumerate(row.cells):
+            stt = _cell_vmerge_state(cell)
+            if stt == 'restart':
+                span = 1
+                rr = r+1
+                while rr < n_rows:
+                    try:
+                        next_cell = table.rows[rr].cells[c]
+                    except Exception:
+                        break
+                    st2 = _cell_vmerge_state(next_cell)
+                    if st2 == 'continue':
+                        span += 1; rr += 1
+                    else:
+                        break
+                arr.append(span)
+            elif stt == 'continue':
+                arr.append(0)
+            else:
+                arr.append(1)
+        result.append(arr)
+    return result
+
+def docx_table_to_html(table):
+    """
+    Render tabel DOCX ke HTML:
+      - Menghormati w:tblGrid (lebar kolom) → <colgroup>
+      - Menangani gridSpan (colspan) dan vMerge (rowspan) akurat
+      - Skip sel yang tertutup merge (pakai matriks occupied pada grid kolom)
+    """
+    grid_widths = _get_tblgrid_widths(table)           # twips per grid column
+    grid_cols = len(grid_widths)
+    n_rows = len(table.rows)
+    if n_rows == 0 or grid_cols == 0:
+        return '<table class="docx-table"></table>'
+
+    total_w = max(1, sum(grid_widths))
+    col_perc = [max(1, int(round(w*100/total_w))) for w in grid_widths]
+    diff = 100 - sum(col_perc)
+    if diff != 0:
+        col_perc[-1] = max(1, col_perc[-1] + diff)
+
+    rowspans = _row_vrowspans(table)
+    occupied = [[False]*grid_cols for _ in range(n_rows)]
+
+    parts = []
+    parts.append('<table class="docx-table">')
+    parts.append('<colgroup>')
+    for p in col_perc:
+        parts.append(f'<col style="width:{p}%">')
+    parts.append('</colgroup>')
+
+    for r_idx, row in enumerate(table.rows):
+        parts.append('<tr>')
+        cpos = 0  # posisi grid kolom saat ini
+
+        for c_idx, cell in enumerate(row.cells):
+            rs = rowspans[r_idx][c_idx] if r_idx < len(rowspans) and c_idx < len(rowspans[r_idx]) else 1
+            if rs == 0:
+                continue  # vMerge-continue
+
+            while cpos < grid_cols and occupied[r_idx][cpos]:
+                cpos += 1
+            if cpos >= grid_cols:
+                continue
+
+            cs = max(1, _cell_gridspan(cell))
+
+            for rr in range(r_idx, min(n_rows, r_idx+rs)):
+                for cc in range(cpos, min(grid_cols, cpos+cs)):
+                    occupied[rr][cc] = True
+
+            inner = "".join(_para_to_html(p) for p in cell.paragraphs) or "&nbsp;"
+            tag = "th" if r_idx == 0 else "td"
+
+            attrs = []
+            if cs > 1:
+                attrs.append(f'colspan="{cs}"')
+            if rs > 1:
+                attrs.append(f'rowspan="{rs}"')
+
+            parts.append(f"<{tag} {' '.join(attrs)}>{inner}</{tag}>")
+            cpos += cs
+
+        parts.append('</tr>')
+
+    parts.append('</table>')
+    return "".join(parts)
+
+def docx_to_html(doc):
+    """Konversi DOCX ke HTML ringan dengan tabel dipertahankan."""
+    out = []
+    for block in doc.element.body.iterchildren():
+        tag = block.tag
+        if tag == qn('w:tbl'):
+            tbl = None
+            for t in doc.tables:
+                if t._tbl is block:
+                    tbl = t; break
+            if tbl is not None:
+                out.append(docx_table_to_html(tbl))
+        elif tag == qn('w:p'):
+            for para in doc.paragraphs:
+                if para._p is block:
+                    out.append(_para_to_html(para))
+                    break
+    return "\n".join(out).strip()
+
 # --------------------- DOC/DOCX extractors -------------------------
 def extract_text_from_docx_bytes(docx_bytes: bytes) -> str:
+    """Return HTML yang mempertahankan struktur tabel (colspan/rowspan, align, bold/italic)."""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
             tmp.write(docx_bytes)
             tmp_path = tmp.name
         doc = Document(tmp_path)
-        parts = []
 
-        # paragraphs
-        parts.extend(p.text for p in doc.paragraphs if p.text)
+        html = docx_to_html(doc)
 
-        # tables (baris → Markdown)
-        for tbl in doc.tables:
-            for row in tbl.rows:
-                cells = [c.text.strip().replace("\n", " ") for c in row.cells]
-                parts.append("| " + " | ".join(cells) + " |")
+        if not html or len(html) < 20:
+            parts = []
+            parts.extend(_para_to_html(p) for p in doc.paragraphs if p.text)
+            for tbl in doc.tables:
+                parts.append(docx_table_to_html(tbl))
+            html = "\n".join(parts)
 
-        return "\n".join(parts).strip()
+        return html
     except Exception:
         return ""
     finally:
@@ -372,6 +571,8 @@ def gemini_ocr_image(image_bytes: bytes) -> str:
     return text
 
 def gemini_ocr_pdf(pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
+    if not google_api_key:
+        return "Please provide a valid Google API Key for OCR/processing."
     suffix = os.path.splitext(filename)[1] or ".pdf"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(pdf_bytes)
@@ -407,25 +608,21 @@ def gemini_ocr_pdf(pdf_bytes: bytes, filename: str = "upload.pdf") -> str:
 # --------------------- PDF/Image/DOC/DOCX pipeline -------------------------
 def process_document_with_gemini(kind: str, name: str, data: bytes) -> str:
     if kind == "pdf":
-        # 1) coba PyPDF2
         raw_text = extract_text_from_pdf_bytes(data)
-        # deteksi sederhana apakah terlihat seperti tabel markdown
         looks_like_table = bool(re.search(r'\|\s*[^|]+\s*\|', raw_text))
         if len(raw_text) >= 200 and looks_like_table:
             return raw_text
-        # 2) jika tidak terlihat tabel (atau pendek), paksa OCR Gemini (lebih bagus untuk tabel)
         return gemini_ocr_pdf(data, filename=name)
 
     if kind == "image":
         return gemini_ocr_image(data)
 
     if kind == "docx":
-        text = extract_text_from_docx_bytes(data)
-        if text and len(text) >= 50:
-            return text
-        # fallback minimal (tidak sebaik parser native)
+        html = extract_text_from_docx_bytes(data)
+        if html and len(html) >= 50:
+            return html
         return _generate_with_fallback([
-            "Extract the full content of this Office document as clean Markdown.",
+            "Extract the full content of this Office document as HTML with tables preserved.",
             data
         ])
 
@@ -458,10 +655,7 @@ def answer_from_image(image_bytes: bytes, question: str) -> str:
 
 def generate_response(context: str, query: str) -> str:
     if not context or len(context) < 10:
-        if "image_bytes" in st.session_state and isinstance(st.session_state.image_bytes, dict):
-            for img_name, img_bytes in st.session_state.image_bytes.items():
-                if any(word.lower() in img_name.lower() for word in query.lower().split()):
-                    return answer_from_image(img_bytes, query)
+        if "image_bytes" in st.session_state and isinstance(st.session_state.image_bytes, dict) and st.session_state.image_bytes:
             first_img = next(iter(st.session_state.image_bytes.values()))
             return answer_from_image(first_img, query)
     try:
@@ -603,7 +797,7 @@ def _structure_stats(md_text: str) -> dict:
     if not md_text:
         return {"text": 0, "tables": 0, "images": 0}
     lines = md_text.splitlines()
-    table_lines = sum(1 for ln in lines if ln.strip().startswith("|") and ln.count("|") >= 2)
+    table_lines = sum(1 for ln in lines if "<table" in md_text or (ln.strip().startswith("|") and ln.count("|") >= 2))
     image_tags = md_text.count("![") + md_text.lower().count("<img")
     text_chars = len(md_text)
     return {"text": text_chars, "tables": table_lines, "images": image_tags}
@@ -808,13 +1002,11 @@ def _parse_markdown_tables(md_text: str) -> list:
         if not rows:
             return
 
-        # Header detection:
         header = None
         if len(rows) >= 2 and _TABLE_SEP_RE.match(buf_lines[1]):  # header | sep | data...
             header = [h if h else f"col_{i+1}" for i, h in enumerate(rows[0])]
             data = rows[2:] if len(rows) > 2 else []
         else:
-            # Coba infer: jika baris pertama lebih "tekstual" → header
             first = rows[0]
             nonnum = sum(1 for x in first if not re.fullmatch(r'[-+]?\d+([.,]\d+)?', (x or '')))
             if nonnum >= max(1, len(first) // 2):
@@ -825,7 +1017,6 @@ def _parse_markdown_tables(md_text: str) -> list:
                 header = [f"col_{i+1}" for i in range(ncol)]
                 data = rows
 
-        # Normalisasi panjang baris
         maxc = len(header)
         norm_rows = []
         for r in data:
@@ -837,7 +1028,7 @@ def _parse_markdown_tables(md_text: str) -> list:
 
         try:
             df = pd.DataFrame(norm_rows, columns=header)
-            tables.append((df, {"doc_section": "All", "table_index": t_idx}))
+            tables.append((df, {"doc_section": "All", "table_index": t_idx, "source": "md"}))
         except Exception:
             pass
 
@@ -855,23 +1046,70 @@ def _parse_markdown_tables(md_text: str) -> list:
 
     return tables
 
+# === NEW: parser tabel HTML (hasil DOCX) ===
+def _parse_html_tables(html_text: str) -> list:
+    """
+    Parse <table> HTML (hasil DOCX) menjadi list of (DataFrame, meta).
+    Prioritas: pandas.read_html; fallback BeautifulSoup jika perlu.
+    """
+    tables = []
+    if not html_text or "<table" not in html_text.lower():
+        return tables
+
+    # 1) Coba langsung dengan pandas
+    try:
+        dfs = pd.read_html(html_text)  # type: ignore
+        for i, df in enumerate(dfs):
+            cols = [str(c) if str(c).strip() else f"col_{j+1}" for j, c in enumerate(df.columns)]
+            df.columns = cols
+            tables.append((df, {"doc_section": "All", "table_index": i, "source": "html"}))
+        if tables:
+            return tables
+    except Exception:
+        pass
+
+    # 2) Fallback ringan pakai BeautifulSoup
+    try:
+        from bs4 import BeautifulSoup  # pip install beautifulsoup4
+        soup = BeautifulSoup(html_text, "html.parser")
+        for i, tbl in enumerate(soup.find_all("table")):
+            rows = []
+            for tr in tbl.find_all("tr"):
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+                if cells:
+                    rows.append(cells)
+            if not rows:
+                continue
+            maxc = max(len(r) for r in rows)
+            norm = [r + [""]*(maxc-len(r)) for r in rows]
+            first_tr = tbl.find_all("tr")[0] if tbl.find_all("tr") else None
+            use_header = first_tr and all(x.name == "th" for x in first_tr.find_all(["th","td"]))
+            if use_header:
+                header, data = norm[0], norm[1:]
+            else:
+                header = [f"col_{j+1}" for j in range(maxc)]
+                data = norm
+            df = pd.DataFrame(data, columns=header)
+            tables.append((df, {"doc_section": "All", "table_index": i, "source": "html"}))
+    except Exception:
+        pass
+
+    return tables
+
 def _is_avg_intent(q: str) -> bool:
     ql = q.lower()
     keys = ["rata rata", "rata-rata", "average", "avg", "mean"]
     return any(k in ql for k in keys)
 
 def _extract_target_column_terms(q: str) -> list:
-    # Dalam tanda kutip
     quoted = re.findall(r'["“”](.+?)["“”]', q)
     terms = [t.strip() for t in quoted if t.strip()]
-    # Setelah kata kunci
     m = re.search(r'\b(kolom|column|field)\s+([A-Za-z0-9_\-\s]+)', q, re.I)
     if m:
         chunk = m.group(2).strip()
         chunk = re.split(r'[,.;:?]|rata|average|mean', chunk, 1)[0].strip()
         if chunk:
             terms.append(chunk)
-    # Fallback
     toks = _tokenize(q)
     toks = [t for t in toks if t not in {"rata", "rata-rata", "average", "mean", "avg", "nilai", "value"}]
     if toks:
@@ -900,6 +1138,8 @@ def _guess_best_column(df: pd.DataFrame, query: str) -> str | None:
         "laba": ["profit", "net profit", "laba bersih", "income"],
         "tanggal": ["date", "periode", "period", "bulan", "month", "year", "tahun"],
         "qty": ["quantity", "jumlah", "kuantitas", "volume"],
+        # penting untuk kasus nilai mahasiswa
+        "nilai": ["score", "skor", "uts", "uas", "nilai uts", "nilai uas", "nilai uts/uas", "nilai ujian"],
     }
     candidates = []
     for t in terms:
@@ -966,25 +1206,13 @@ def _to_float_id_en(num: str) -> float | None:
             return None
 
 def _extract_scores_from_text(text: str) -> list[float]:
-    """
-    Fallback untuk dokumen ranking seperti contoh:
-    '... 22090098 NAMA 93,7 089670916052 ...'
-    Strategi:
-      1) Cari angka 0..100 yang diikuti nomor HP -> (score, phone)
-      2) Atau pola 'rank nim nama score' -> ambil score
-      3) Atau angka di dekat kata 'nilai'
-    """
     scores: list[float] = []
-    t = " ".join(text.split())  # rapikan spasi
-
-    # 1) Angka sebelum nomor HP (0xxxxxxxxxx…)
+    t = " ".join(text.split())
     p_phone = re.compile(r'(\d{1,3}(?:[.,]\d{1,2})?)\s+(0\d{9,13})')
     for m in p_phone.finditer(t):
         val = _to_float_id_en(m.group(1))
         if val is not None and 0 <= val <= 100:
             scores.append(val)
-
-    # 2) 'rank nim nama score'
     p_rank = re.compile(
         r'\b\d{1,3}\s+(?:\d{8,12})\s+[A-Za-zÀ-ÿ\.\'\- ]{2,}?'
         r'\s+(\d{1,3}(?:[.,]\d{1,2})?)\b'
@@ -993,8 +1221,6 @@ def _extract_scores_from_text(text: str) -> list[float]:
         val = _to_float_id_en(m.group(1))
         if val is not None and 0 <= val <= 100:
             scores.append(val)
-
-    # 3) Di dekat kata "nilai"
     if not scores:
         near = []
         for m in re.finditer(r'(nilai[^0-9]{0,30})(\d{1,3}(?:[.,]\d{1,2})?)', t, flags=re.I):
@@ -1003,8 +1229,6 @@ def _extract_scores_from_text(text: str) -> list[float]:
                 near.append(val)
         if len(near) >= 3:
             scores.extend(near)
-
-    # Dedup ringan
     if scores:
         seen = set(); uniq = []
         for v in scores:
@@ -1012,7 +1236,6 @@ def _extract_scores_from_text(text: str) -> list[float]:
             if key not in seen:
                 seen.add(key); uniq.append(v)
         scores = uniq
-
     return scores
 
 # ========== BARU: pilih dokumen berdasar pertanyaan ==========
@@ -1022,15 +1245,10 @@ def _normalize_filename(name: str) -> str:
     return base
 
 def select_docs_for_query(query: str, documents: list) -> list:
-    """
-    Jika user menyebutkan nama file (tanpa ekstensi) pada pertanyaan,
-    kembalikan hanya dokumen yang disebut. Jika tidak ada yang match, kembalikan semua.
-    """
     q = query.lower()
     matches = []
     for d in documents:
         norm = _normalize_filename(d["name"])
-        # match frasa penuh atau sebagian (split ke kata-kata unik)
         if norm and norm in q:
             matches.append(d)
         else:
@@ -1044,24 +1262,25 @@ def select_docs_for_query(query: str, documents: list) -> list:
         return matches
     return documents
 
-# ========== MODIFIED: hitung rata-rata per dokumen ==========
+# ========== MODIFIED: hitung rata-rata per dokumen (HTML + Markdown) ==========
 def compute_average_per_doc(query: str, documents: list) -> list[dict]:
-    """
-    Hitung rata-rata kolom target di tiap dokumen.
-    Return list of dict: [{'doc':..., 'column':..., 'value':..., 'n':...}, ...]
-    """
     if not _is_avg_intent(query):
         return []
 
     results = []
-
     for doc in documents:
         content = doc.get("content") or ""
-        tables = _parse_markdown_tables(content)
+        tables = []
+
+        # DOCX → HTML tables
+        if "<table" in content.lower():
+            tables += _parse_html_tables(content)
+
+        # PDF/Markdown tables
+        tables += _parse_markdown_tables(content)
 
         best = None
 
-        # --- cari di tabel markdown ---
         for df, meta in tables:
             if df.empty:
                 continue
@@ -1071,27 +1290,27 @@ def compute_average_per_doc(query: str, documents: list) -> list[dict]:
             s = pd.to_numeric(
                 df[col].astype(str)
                     .str.replace(r'[^\d\-\.,]', '', regex=True)
-                    .str.replace('.', '', regex=False)
-                    .str.replace(',', '.', regex=False),
+                    .str.replace('.', '', regex=False)   # ribuan → buang titik
+                    .str.replace(',', '.', regex=False),  # desimal id → '.'
                 errors='coerce'
             )
             vals = s.dropna()
+            # singkirkan angka tidak masuk akal (mis. no. telepon)
+            vals = vals[(vals >= 0) & (vals <= 100)]
             if len(vals) == 0:
                 continue
+
             mean_val = float(vals.mean())
-            cand = {"doc": doc["name"], "column": col,
-                    "value": mean_val, "n": int(len(vals))}
+            cand = {"doc": doc["name"], "column": col, "value": mean_val, "n": int(len(vals))}
             if (best is None) or (cand["n"] > best["n"]):
                 best = cand
 
-        # --- fallback dari teks polos ---
-        if best is None or best["n"] < 3:
+        # Fallback teks polos tetap ada
+        if (best is None) or best["n"] < 3:
             scores = _extract_scores_from_text(content)
             if len(scores) >= 3:
                 mean_val = float(np.mean(scores))
-                cand = {"doc": doc["name"], "column": "Nilai (fallback)",
-                        "value": mean_val, "n": int(len(scores))}
-                best = cand
+                best = {"doc": doc["name"], "column": "Nilai (fallback)", "value": mean_val, "n": int(len(scores))}
 
         if best:
             results.append(best)
@@ -1207,7 +1426,10 @@ with col1:
                 chosen_kind, os.path.basename(clean_url) or "download", data
             )
             if chosen_kind == "image":
-                st.session_state.image_bytes = data
+                if "image_bytes" not in st.session_state or not isinstance(st.session_state.image_bytes, dict):
+                    st.session_state.image_bytes = {}
+                st.session_state.image_bytes[os.path.basename(clean_url) or "image"] = data
+
             if st.session_state.ocr_content:
                 _build_retrieval_index(st.session_state.ocr_content)
                 return True, "Document processed successfully!"
@@ -1373,7 +1595,6 @@ with col2:
 
             st.dataframe(stats_data, use_container_width=True)
 
-            # -------- 1) Document Health --------
             st.markdown("### Document Health")
             dh1, dh2 = st.columns([1,1])
             with dh1:
@@ -1425,7 +1646,6 @@ with col2:
             with st.spinner("Generating response..."):
                 ans = None
                 try:
-                    # pilih dokumen berdasar apakah user menyebut nama file
                     docs_to_use = select_docs_for_query(user_q, st.session_state.documents)
                     avg_results = compute_average_per_doc(user_q, docs_to_use)
                 except Exception:
@@ -1440,7 +1660,6 @@ with col2:
                         else:
                             ans = f"The average in document **{r['doc']}** for column **{r['column']}** is **{val_str}** (n={r['n']})."
                     else:
-                        # tampilkan semua dan bandingkan
                         ans_lines = []
                         for r in avg_results:
                             val_str = f"{r['value']:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -1452,14 +1671,13 @@ with col2:
                         else:
                             ans = "Average per document:\n" + "\n".join(ans_lines)
                             ans += f"\n\n📊 Highest is in **{best['doc']}** with average {best['value']:.2f}."
-                # 2) Fallback RAG jika bukan intent rata-rata / gagal parsing
                 if not ans:
                     if not google_api_key:
                         ans = "Please provide a valid Google API Key."
                     else:
                         ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
             st.session_state.chat_history.append({"role": "assistant", "content": ans})
-            st.rerun()  # field sudah kosong otomatis oleh form
+            st.rerun()
 
     else:
         st.info("No documents processed yet. You can either upload files or just type a URL below and press Ask.")
@@ -1513,7 +1731,7 @@ with col2:
                         else:
                             ans = generate_response_with_fallback(st.session_state.ocr_content, user_q)
                 st.session_state.chat_history.append({"role": "assistant", "content": ans})
-                st.rerun()  # field sudah kosong otomatis oleh form
+                st.rerun()
             else:
                 st.warning("Please provide a URL or upload a document first.")
 
@@ -1522,5 +1740,8 @@ if st.session_state.get("documents"):
     with st.expander("📄 View All Document Contents"):
         for i, doc in enumerate(st.session_state.documents):
             st.markdown(f"### {doc['name']} ({doc['type']})")
-            st.markdown(doc['content'])
+            if isinstance(doc['content'], str) and ("<table" in doc['content'] or "<p" in doc['content'] or "</table>" in doc['content']):
+                st.markdown(doc['content'], unsafe_allow_html=True)
+            else:
+                st.markdown(doc['content'])
             st.markdown("---")
